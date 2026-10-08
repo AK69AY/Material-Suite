@@ -62,8 +62,13 @@ AGENT_MODES = {
 
 
 # --- INITIALIZE SESSION STATE SAFELY AT THE TOP OF MAIN ---
+# Priority: Streamlit Secrets -> user sidebar override -> local default.
 if "ollama_url" not in st.session_state:
-    st.session_state.ollama_url = OLLAMA_DEFAULT
+    try:
+        _secret_url = str(st.secrets.get("OLLAMA_URL") or "").strip()
+    except Exception:
+        _secret_url = ""
+    st.session_state.ollama_url = _secret_url or OLLAMA_DEFAULT
 
 if "selected_heavy_model" not in st.session_state:
     st.session_state.selected_heavy_model = "deepseek-r1:8b"
@@ -286,13 +291,22 @@ MD3_CSS = """
 st.markdown(MD3_CSS, unsafe_allow_html=True)
 
 
-def net_call(fn, *args, timeout=25, **kwargs):
+def net_call(fn, *args, timeout=25, service=None, **kwargs):
     executor = ThreadPoolExecutor(max_workers=1)
     future = executor.submit(fn, *args, **kwargs)
     try:
         return future.result(timeout=timeout), None
     except FutureTimeout:
         return None, "network timeout exhausted"
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, OSError):
+        if service == "ollama":
+            url = st.session_state.get("ollama_url", OLLAMA_DEFAULT)
+            return None, (
+                f"⚠️ Could not connect to Ollama at {url}. If running on Streamlit Cloud, "
+                "ensure your ngrok/tunnel is active and paste the public tunnel URL above. "
+                "Run: ngrok http 11434 locally."
+            )
+        return None, "connection failed or timed out (check network / tunnel availability)"
     except Exception as exc:
         return None, f"{type(exc).__name__}: {exc}"
     finally:
@@ -304,8 +318,8 @@ def discover_models(url):
         r = requests.get(url.rstrip("/") + "/api/tags", timeout=(3, 6))
         r.raise_for_status()
         return [m["name"] for m in r.json().get("models", [])]
-    models, err = net_call(_call, timeout=12)
-    return models or []
+    models, err = net_call(_call, timeout=12, service="ollama")
+    return models or [], err
 
 
 def classify_models(models):
@@ -359,7 +373,7 @@ def ollama_chat(system, user, model, url, temperature=0.4, timeout=240):
         )
         r.raise_for_status()
         return r.json().get("message", {}).get("content", "")
-    return net_call(_call, timeout=timeout + 12)
+    return net_call(_call, timeout=timeout + 12, service="ollama")
 
 
 class DDGParser(HTMLParser):
@@ -736,16 +750,26 @@ def render_mermaid(diagram):
 
 
 if not st.session_state.models_discovered:
-    st.session_state.ollama_models = discover_models(st.session_state.ollama_url)
+    _models, _derr = discover_models(st.session_state.ollama_url)
+    st.session_state.ollama_models = _models
     st.session_state.models_discovered = True
-    if st.session_state.ollama_models:
-        st.session_state.ollama_status = ("ok", len(st.session_state.ollama_models))
+    if _models:
+        st.session_state.ollama_status = ("ok", len(_models))
     else:
-        st.session_state.ollama_status = ("error", "Could not reach Ollama")
+        st.session_state.ollama_status = (
+            "error",
+            _derr or "Could not reach Ollama",
+        )
 
 
 def set_module(name):
     st.session_state.module = name
+
+
+def _on_endpoint_change():
+    st.session_state.models_discovered = False
+    st.session_state.ollama_models = []
+    st.session_state.ollama_status = None
 
 
 with st.sidebar:
@@ -774,27 +798,40 @@ with st.sidebar:
     status = st.session_state.ollama_status
     if status and status[0] == "ok":
         st.badge(f"Ollama online - {status[1]} models", color="green")
-    else:
+    elif status and status[0] == "error":
+        _url = html_lib.escape(str(st.session_state.ollama_url))
         st.markdown(
-            '<div class="ms-offline-banner">'
-            '<strong>Ollama is offline.</strong><br>'
-            'Start the server with <code>ollama serve</code> then click '
-            '<em>Rediscover Models</em> below.</div>',
+            f'<div class="ms-offline-banner">'
+            f'<strong>⚠️ Could not connect to Ollama at <code>{_url}</code>.</strong><br>'
+            'If running on Streamlit Cloud, ensure your ngrok/tunnel is active and paste '
+            'the public tunnel URL below. Run: <code>ngrok http 11434</code> locally.</div>',
             unsafe_allow_html=True,
         )
+        if status[1]:
+            st.caption(str(status[1]))
         st.badge("Ollama offline", color="red")
+    else:
+        st.caption("Checking Ollama connection...")
+
+    st.text_input(
+        "Ollama API Endpoint (Local or Tunnel URL)",
+        key="ollama_url",
+        on_change=_on_endpoint_change,
+        placeholder="http://localhost:11434 or https://xxxx.ngrok-free.app",
+        help="Local default: http://localhost:11434. On Streamlit Cloud, paste your "
+             "public ngrok/Cloudflare tunnel URL (run: ngrok http 11434).",
+    )
 
     with st.expander("Model Router", expanded=False):
         models = st.session_state.ollama_models
         if not models:
             st.caption("No models discovered.")
             if st.button("Rediscover Models", icon=":material/refresh:", width="stretch"):
-                st.session_state.ollama_models = discover_models(st.session_state.ollama_url)
+                _m, _e = discover_models(st.session_state.ollama_url)
+                st.session_state.ollama_models = _m
                 st.session_state.models_discovered = True
                 st.session_state.ollama_status = (
-                    ("ok", len(st.session_state.ollama_models))
-                    if st.session_state.ollama_models
-                    else ("error", "Could not reach Ollama")
+                    ("ok", len(_m)) if _m else ("error", _e or "Could not reach Ollama")
                 )
                 st.rerun()
         else:
@@ -813,12 +850,15 @@ with st.sidebar:
             st.selectbox("Fast summarization", opts, key="model_fast_sel",
                          help="Snippet parsing, quick summaries, status checks")
             if st.button("Rediscover Models", icon=":material/refresh:", width="stretch"):
-                st.session_state.ollama_models = discover_models(st.session_state.ollama_url)
+                _m, _e = discover_models(st.session_state.ollama_url)
+                st.session_state.ollama_models = _m
+                st.session_state.models_discovered = True
+                st.session_state.ollama_status = (
+                    ("ok", len(_m)) if _m else ("error", _e or "Could not reach Ollama")
+                )
                 st.rerun()
 
-    with st.expander("Endpoint"):
-        st.text_input("Ollama URL", key="ollama_url")
-    st.caption("3 modules | multi-model routing | local-first")
+    st.caption("3 modules | multi-model routing | local or tunnel")
 
 
 def render_coding_engine():
