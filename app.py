@@ -61,6 +61,19 @@ AGENT_MODES = {
 }
 
 
+# --- INITIALIZE SESSION STATE SAFELY AT THE TOP OF MAIN ---
+if "ollama_url" not in st.session_state:
+    st.session_state.ollama_url = OLLAMA_DEFAULT
+
+if "selected_heavy_model" not in st.session_state:
+    st.session_state.selected_heavy_model = "deepseek-r1:8b"
+
+if "selected_coder_model" not in st.session_state:
+    st.session_state.selected_coder_model = "qwen2.5-coder:7b"
+
+if "selected_fast_model" not in st.session_state:
+    st.session_state.selected_fast_model = "phi4-mini:latest"
+
 for key, value in {
     "module": "coding",
     "ollama_url": OLLAMA_DEFAULT,
